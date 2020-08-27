@@ -19,8 +19,6 @@ const openapiElement = CodeMirror.fromTextArea(document.getElementById('openapi'
 });
 
 const update = () => {
-    console.log('updating');
-    console.log(postmanElement);
     const postman = postmanElement.getValue();
     try {
         const openapi = postman2openapi.transpile(postman, 'yaml');
