@@ -1,6 +1,8 @@
 import { default as collection } from './collection';
 import CodeMirror from 'codemirror/lib/codemirror.js';
-import * as postman2openapi from "postman2openapi";
+import * as postman2openapi from 'postman2openapi';
+import _CodeMirrorStyles from './codemirror.css'
+import _DemoStyles from './demo.css'
 
 const postmanElement = CodeMirror.fromTextArea(document.getElementById('postman'), {
     lineNumbers: true

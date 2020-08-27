@@ -34,8 +34,11 @@
   "devDependencies": {
     "@types/codemirror": "0.0.97",
     "copy-webpack-plugin": "^5.0.0",
+    "css-loader": "^4.2.2",
+    "file-loader": "^6.0.0",
+    "style-loader": "^1.2.1",
     "webpack": "^4.29.3",
-    "webpack-cli": "^3.1.0",
+    "webpack-cli": "^3.3.12",
     "webpack-dev-server": "^3.1.5"
   }
 }
