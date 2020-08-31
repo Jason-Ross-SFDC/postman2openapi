@@ -458,7 +458,14 @@ impl<'a> Transpiler<'a> {
 
             if let Some(method) = &request.method {
                 let m = method.to_lowercase();
-                let mut op_id = request_name.to_case(Case::Camel);
+                let mut op_id = request_name
+                    .chars()
+                    .map(|c| match c {
+                        'A'..='Z' | 'a'..='z' | '0'..='9' => c,
+                        _ => ' ',
+                    })
+                    .collect::<String>()
+                    .to_case(Case::Camel);
                 match state.operation_ids.get_mut(&op_id) {
                     Some(v) => {
                         *v += 1;
@@ -630,22 +637,23 @@ impl<'a> Transpiler<'a> {
             serde_json::Value::Array(a) => {
                 let mut schema = openapi3::Schema::default();
                 schema.schema_type = Some("array".to_string());
-                // TODO: Iterate over the array items and build up a oneOf schema.
-                if let Some(i) = &a.get(0) {
-                    if let Some(item_schema) = self.generate_schema(i) {
-                        let mut mut_schema = item_schema;
-                        for n in 1..a.len() {
-                            if let Some(i2) = &a.get(n) {
-                                if let Some(i2_inner) = self.generate_schema(i2) {
-                                    mut_schema = self.merge_schemas(&mut_schema, &i2_inner);
-                                }
+                let mut item_schema = openapi3::Schema::default();
+
+                for n in 0..a.len() {
+                    if let Some(i) = a.get(n) {
+                        if let Some(i) = self.generate_schema(i) {
+                            if n == 0 {
+                                item_schema = i;
+                            } else {
+                                item_schema = self.merge_schemas(item_schema, &i);
                             }
                         }
-                        schema.items = Some(Box::new(mut_schema));
                     }
-                } else {
-                    schema.items = Some(Box::new(openapi3::Schema::default()));
                 }
+
+                schema.items = Some(Box::new(item_schema));
+                schema.example = Some(value.clone());
+
                 Some(schema)
             }
             serde_json::Value::String(_) => {
@@ -677,34 +685,50 @@ impl<'a> Transpiler<'a> {
 
     fn merge_schemas(
         &self,
-        original: &openapi3::Schema,
+        mut original: openapi3::Schema,
         new: &openapi3::Schema,
     ) -> openapi3::Schema {
-        let mut cloned = original.clone();
-
-        if cloned.nullable.is_none() && new.nullable.is_some() {
-            cloned.nullable = new.nullable;
+        // If the new schema has a nullable Option but the original doesn't,
+        // set the original nullable to the new one.
+        if original.nullable.is_none() && new.nullable.is_some() {
+            original.nullable = new.nullable;
         }
 
-        if let Some(cloned_nullable) = cloned.nullable {
+        // If both original and new have a nullable Option,
+        // If any of their values is true, set to true.
+        if let Some(original_nullable) = original.nullable {
             if let Some(new_nullable) = new.nullable {
-                if new_nullable != cloned_nullable {
-                    cloned.nullable = Some(true);
+                if new_nullable != original_nullable {
+                    original.nullable = Some(true);
                 }
             }
         }
 
-        if cloned.schema_type.is_none() && new.schema_type.is_some() {
-            cloned.schema_type = new.schema_type.clone();
+        if let Some(ref mut any_of) = original.any_of {
+            any_of.push(openapi3::ObjectOrReference::Object(new.clone()));
+            return original;
         }
-        if let Some(t) = &cloned.schema_type {
+
+        // Reset the schema type.
+        if original.schema_type.is_none() && new.schema_type.is_some() && new.any_of.is_none() {
+            original.schema_type = new.schema_type.clone();
+        }
+
+        // If both types are objects, merge the schemas of each property.
+        if let Some(t) = &original.schema_type {
             if let "object" = t.as_str() {
-                if let Some(properties) = &mut cloned.properties {
+                if let Some(original_properties) = &mut original.properties {
                     if let Some(new_properties) = &new.properties {
-                        for (key, val) in properties.iter_mut() {
-                            if let Some(v) = &new_properties.get(key) {
+                        for (key, val) in original_properties.iter_mut() {
+                            if let Some(v) = new_properties.get(key) {
                                 let prop = v;
-                                *val = self.merge_schemas(&val, &prop);
+                                *val = self.merge_schemas(val.clone(), &prop);
+                            }
+                        }
+
+                        for (key, val) in new_properties.iter() {
+                            if !original_properties.contains_key(key) {
+                                original_properties.insert(key.to_string(), val.clone());
                             }
                         }
                     }
@@ -712,7 +736,22 @@ impl<'a> Transpiler<'a> {
             }
         }
 
-        cloned
+        if let Some(ref original_type) = original.schema_type {
+            if let Some(ref new_type) = new.schema_type {
+                if new_type != original_type {
+                    let cloned = original.clone();
+                    original.schema_type = None;
+                    original.properties = None;
+                    original.items = None;
+                    original.any_of = Some(vec![
+                        openapi3::ObjectOrReference::Object(cloned),
+                        openapi3::ObjectOrReference::Object(new.clone()),
+                    ]);
+                }
+            }
+        }
+
+        original
     }
 
     fn generate_path_parameters(
@@ -767,28 +806,36 @@ impl<'a> Transpiler<'a> {
         &self,
         query_params: &[postman::QueryParam],
     ) -> Option<Vec<openapi3::ObjectOrReference<openapi3::Parameter>>> {
-        let params: Vec<openapi3::ObjectOrReference<openapi3::Parameter>> = query_params
+        let mut keys = vec![];
+        let params = query_params
             .iter()
-            .map(|qp| {
-                let mut param = openapi3::Parameter::default();
-                if let Some(key) = &qp.key {
+            .filter_map(|qp| match qp.key {
+                Some(ref key) => {
+                    if keys.contains(&key.as_str()) {
+                        return None;
+                    }
+
+                    keys.push(key);
+                    let mut param = openapi3::Parameter::default();
+
                     param.name = key.to_string();
-                }
-                param.location = "query".to_string();
-                let mut schema = openapi3::Schema::default();
-                schema.schema_type = Some("string".to_string());
-                param.description = extract_description(&qp.description);
+                    param.location = "query".to_string();
+                    let mut schema = openapi3::Schema::default();
+                    schema.schema_type = Some("string".to_string());
+                    param.description = extract_description(&qp.description);
 
-                if let Some(pval) = &qp.value {
-                    schema.example = Some(serde_json::Value::String(
-                        self.resolve_variables(pval, VAR_REPLACE_CREDITS),
-                    ));
-                }
+                    if let Some(pval) = &qp.value {
+                        schema.example = Some(serde_json::Value::String(
+                            self.resolve_variables(pval, VAR_REPLACE_CREDITS),
+                        ));
+                    }
 
-                param.schema = Some(schema);
-                openapi3::ObjectOrReference::Object(param)
+                    param.schema = Some(schema);
+                    Some(openapi3::ObjectOrReference::Object(param))
+                }
+                None => None,
             })
-            .collect();
+            .collect::<Vec<openapi3::ObjectOrReference<openapi3::Parameter>>>();
 
         if !params.is_empty() {
             Some(params)
